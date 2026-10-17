@@ -36,7 +36,7 @@ GITHUB_BASE = (
 )
 
 # CHANGE THIS TO YOUR ACTUAL ESP32-CAM STREAM URL
-ESP32_CAM_URL = "http://172.24.146.53/stream"
+ESP32_CAM_URL = "http://172.24.146.53:81/stream"
 
 # Arduino Uno USB connection
 ARDUINO_PORT = "COM9"
