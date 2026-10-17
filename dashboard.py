@@ -1,4 +1,3 @@
-
 from flask import Flask, render_template_string, jsonify, Response
 from ultralytics import YOLO
 import cv2
