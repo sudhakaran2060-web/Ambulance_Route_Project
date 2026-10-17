@@ -1,543 +1,504 @@
-from flask import Flask, render_template_string, jsonify, Response
-from ultralytics import YOLO
+
+import streamlit as st
 import cv2
-import requests
-import threading
+import numpy as np
 import time
-import os
+import serial
+from ultralytics import YOLO
 
-app = Flask(__name__)
+# ==========================================
+# PAGE SETTINGS
+# ==========================================
 
-# ---------------- CONFIGURATION ----------------
-
-GITHUB_BASE = (
-    "https://raw.githubusercontent.com/"
-    "sudhakaran2060-web/Ambulance_Route_Project/main/"
+st.set_page_config(
+    page_title="Smart Ambulance Route Monitoring",
+    page_icon="🚑",
+    layout="wide"
 )
 
-ROADS = {
-    "Road 1": GITHUB_BASE + "road1.mp4",
-    "Road 2": GITHUB_BASE + "road2.mp4",
-    "Road 3": GITHUB_BASE + "road3.mp4",
-}
+# ==========================================
+# PROFESSIONAL DESIGN
+# ==========================================
 
-MODEL_PATH = "yolo11n.pt"
-CONFIDENCE = 0.35
-VEHICLE_CLASSES = {"car", "bus", "truck", "motorcycle"}
-MAX_DENSITY_VEHICLES = 20
-
-os.makedirs("videos", exist_ok=True)
-
-# ---------------- YOLO MODEL ----------------
-
-model = YOLO(MODEL_PATH)
-
-lock = threading.RLock()
-
-road_data = {
-    road: {
-        "vehicle_count": 0,
-        "density": 0,
-        "traffic_level": "Waiting",
-        "status": "Initializing",
-        "updated": "",
-        "frame": None,
-    }
-    for road in ROADS
-}
-
-
-# ---------------- DOWNLOAD VIDEO ----------------
-
-def download_video(road, url):
-    filename = os.path.join(
-        "videos", road.lower().replace(" ", "") + ".mp4"
-    )
-
-    # Reuse the downloaded file
-    if os.path.exists(filename) and os.path.getsize(filename) > 0:
-        return filename
-
-    try:
-        print(f"[{road}] Downloading video...")
-
-        response = requests.get(
-            url,
-            stream=True,
-            timeout=(15, 120)
-        )
-        response.raise_for_status()
-
-        temp_file = filename + ".part"
-        total_bytes = 0
-
-        with open(temp_file, "wb") as file:
-            for chunk in response.iter_content(1024 * 1024):
-                if chunk:
-                    file.write(chunk)
-                    total_bytes += len(chunk)
-
-        if total_bytes == 0:
-            raise ValueError("Downloaded video is empty")
-
-        os.replace(temp_file, filename)
-
-        print(f"[{road}] Download complete")
-        return filename
-
-    except Exception as error:
-        print(f"[{road}] Download failed: {error}")
-
-        if os.path.exists(filename + ".part"):
-            os.remove(filename + ".part")
-
-        return None
-
-
-# ---------------- TRAFFIC ANALYSIS ----------------
-
-def process_road(road, url):
-    while True:
-        filename = download_video(road, url)
-
-        if not filename:
-            with lock:
-                road_data[road]["status"] = (
-                    "Cannot access video. Check GitHub URL."
-                )
-                road_data[road]["traffic_level"] = "Unavailable"
-
-            time.sleep(15)
-            continue
-
-        cap = cv2.VideoCapture(filename)
-
-        if not cap.isOpened():
-            with lock:
-                road_data[road]["status"] = (
-                    "OpenCV cannot open video"
-                )
-
-            cap.release()
-            time.sleep(10)
-            continue
-
-        print(f"[{road}] YOLO analysis started")
-
-        with lock:
-            road_data[road]["status"] = "Running"
-
-        while True:
-            success, frame = cap.read()
-
-            # Replay video when it reaches the end
-            if not success:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                success, frame = cap.read()
-
-                if not success:
-                    break
-
-            # Resize to reduce CPU usage
-            height, width = frame.shape[:2]
-
-            if width > 640:
-                new_height = int(height * 640 / width)
-                frame = cv2.resize(frame, (640, new_height))
-
-            try:
-                # Use one shared model safely across all roads
-                with lock:
-                    result = model.predict(
-                        frame,
-                        conf=CONFIDENCE,
-                        verbose=False
-                    )[0]
-
-                vehicle_count = 0
-
-                if result.boxes is not None:
-                    for box in result.boxes:
-                        class_id = int(box.cls[0].item())
-                        label = model.names[class_id]
-
-                        if label in VEHICLE_CLASSES:
-                            vehicle_count += 1
-
-                # Density estimate based on the current frame
-                density = min(
-                    100,
-                    round(
-                        vehicle_count
-                        * 100
-                        / MAX_DENSITY_VEHICLES
-                    )
-                )
-
-                if vehicle_count <= 5:
-                    traffic_level = "Low"
-                elif vehicle_count <= 12:
-                    traffic_level = "Medium"
-                else:
-                    traffic_level = "High"
-
-                annotated_frame = result.plot()
-
-                # Encode annotated frame for the dashboard
-                success_jpg, encoded = cv2.imencode(
-                    ".jpg", annotated_frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, 75]
-                )
-
-                with lock:
-                    road_data[road].update({
-                        "vehicle_count": vehicle_count,
-                        "density": density,
-                        "traffic_level": traffic_level,
-                        "status": "Running",
-                        "updated": time.strftime("%H:%M:%S"),
-                        "frame": (
-                            encoded.tobytes()
-                            if success_jpg else None
-                        ),
-                    })
-
-            except Exception as error:
-                print(f"[{road}] Detection error: {error}")
-
-                with lock:
-                    road_data[road]["status"] = (
-                        "Detection error: " + str(error)
-                    )
-
-                time.sleep(1)
-
-            time.sleep(0.03)
-
-        cap.release()
-
-        with lock:
-            road_data[road]["status"] = (
-                "Video ended or cannot read frames"
-            )
-
-        time.sleep(3)
-
-
-# ---------------- DASHBOARD HTML ----------------
-
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Smart City Traffic Monitoring</title>
-
+st.markdown("""
 <style>
-body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-    background: #101827;
-    color: white;
+.stApp {
+    background-color: #f3f6fb;
 }
-header {
-    padding: 24px;
-    text-align: center;
-    background: #17253a;
+
+.block-container {
+    max-width: 1300px;
+    padding-top: 2rem;
 }
-header h1 {
-    margin: 0 0 8px;
+
+h1, h2, h3 {
+    color: #102a43 !important;
 }
-header p {
-    color: #bdcbe0;
-}
-.container {
-    padding: 20px;
-    max-width: 1500px;
-    margin: auto;
-}
-.summary, .roads {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 16px;
-}
-.card, .road {
-    background: #1b2a40;
-    border: 1px solid #34465e;
+
+[data-testid="stMetric"] {
+    background: white;
+    border: 1px solid #cbd5e1;
     border-radius: 12px;
-    overflow: hidden;
-}
-.card {
     padding: 18px;
 }
-.card h3 {
-    color: #c0cee1;
-    font-size: 15px;
+
+[data-testid="stDataFrame"] {
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
 }
-.value {
-    font-size: 30px;
-    font-weight: bold;
+
+.dashboard-header {
+    background: linear-gradient(
+        110deg, #102a43, #205b94
+    );
+    padding: 25px;
+    border-radius: 12px;
+    margin-bottom: 20px;
 }
-.road h2 {
-    padding: 16px;
+
+.dashboard-header h2 {
+    color: white !important;
     margin: 0;
 }
-.video {
-    width: 100%;
-    aspect-ratio: 16/9;
-    background: #05080d;
-    object-fit: contain;
-    display: block;
+
+.dashboard-header p {
+    color: #dbeafe;
+    margin-bottom: 0;
 }
-.metrics {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    padding: 14px;
-}
-.metric {
-    background: #101b2b;
-    padding: 12px;
+
+.stButton > button[kind="primary"] {
+    background: #123b67;
+    color: white;
     border-radius: 8px;
 }
-.metric span {
-    display: block;
-    font-size: 12px;
-    color: #bdcbe0;
-    margin-bottom: 7px;
-}
-.metric strong {
-    font-size: 20px;
-}
-.status {
-    padding: 0 14px 14px;
-    color: #bdcbe0;
-    overflow-wrap: anywhere;
-    font-size: 13px;
-}
-.low { color: #4ade80; }
-.medium { color: #facc15; }
-.high { color: #fb7185; }
-
-@media(max-width: 950px) {
-    .roads, .summary {
-        grid-template-columns: 1fr 1fr;
-    }
-}
-@media(max-width: 600px) {
-    .roads, .summary {
-        grid-template-columns: 1fr;
-    }
-}
 </style>
-</head>
+""", unsafe_allow_html=True)
 
-<body>
-
-<header>
-    <h1>Smart City Traffic Monitoring</h1>
-    <p>YOLO Vehicle Detection | Three Road Monitoring</p>
-</header>
-
-<div class="container">
-
-<section class="summary">
-    <div class="card">
-        <h3>Roads Configured</h3>
-        <div class="value">3</div>
-    </div>
-
-    <div class="card">
-        <h3>Total Vehicles in Current Frames</h3>
-        <div class="value" id="total">0</div>
-    </div>
-
-    <div class="card">
-        <h3>Roads Running</h3>
-        <div class="value" id="running">0 / 3</div>
-    </div>
-</section>
-
-<br>
-
-<section class="roads">
-{% for road in roads %}
-<div class="road">
-    <h2>{{ road }}</h2>
-
-    <img class="video"
-         src="/video/{{ road }}"
-         alt="{{ road }} video feed">
-
-    <div class="metrics">
-        <div class="metric">
-            <span>Vehicle Count</span>
-            <strong id="{{ road }}_count">0</strong>
-        </div>
-
-        <div class="metric">
-            <span>Traffic Density</span>
-            <strong id="{{ road }}_density">0%</strong>
-        </div>
-
-        <div class="metric">
-            <span>Traffic Level</span>
-            <strong id="{{ road }}_level">Waiting</strong>
-        </div>
-
-        <div class="metric">
-            <span>Last Update</span>
-            <strong id="{{ road }}_updated">--</strong>
-        </div>
-    </div>
-
-    <div class="status" id="{{ road }}_status">
-        Connecting to video...
-    </div>
+st.markdown("""
+<div class="dashboard-header">
+    <h2>SMART AMBULANCE ROUTE MONITORING</h2>
+    <p>
+        Automatic Traffic Detection and
+        Emergency Route Recommendation
+    </p>
 </div>
-{% endfor %}
-</section>
+""", unsafe_allow_html=True)
 
-</div>
+st.caption(
+    "YOLO Vehicle Detection | Three-Road Monitoring | "
+    "Arduino Uno LCD"
+)
 
-<script>
-async function refreshDashboard() {
-    try {
-        const response = await fetch("/data", {
-            cache: "no-store"
-        });
+# ==========================================
+# CAMERA CONFIGURATION
+# ==========================================
 
-        if (!response.ok) {
-            throw new Error("Unable to read dashboard data");
-        }
+st.sidebar.header("Camera Settings")
 
-        const data = await response.json();
+st.sidebar.caption(
+    "Use 0, 1, 2 for local webcams, "
+    "or an ESP32-CAM/IP camera stream URL."
+)
 
-        let total = 0;
-        let running = 0;
+source1 = st.sidebar.text_input(
+    "Road 1 Camera",
+    value="0"
+)
 
-        for (const [road, item] of Object.entries(data)) {
-            document.getElementById(road + "_count").textContent =
-                item.vehicle_count;
+source2 = st.sidebar.text_input(
+    "Road 2 Camera",
+    value="1"
+)
 
-            document.getElementById(road + "_density").textContent =
-                item.density + "%";
+source3 = st.sidebar.text_input(
+    "Road 3 Camera",
+    value="2"
+)
 
-            const level = document.getElementById(road + "_level");
-            level.textContent = item.traffic_level;
-            level.className = "";
+arduino_port = st.sidebar.text_input(
+    "Arduino COM Port",
+    value="COM3"
+)
 
-            if (item.traffic_level === "Low") {
-                level.classList.add("low");
-            } else if (item.traffic_level === "Medium") {
-                level.classList.add("medium");
-            } else if (item.traffic_level === "High") {
-                level.classList.add("high");
-            }
+duration = st.sidebar.slider(
+    "Analysis duration per road (seconds)",
+    min_value=5,
+    max_value=30,
+    value=10
+)
 
-            document.getElementById(road + "_updated").textContent =
-                item.updated || "--";
+ROADS = [
+    {"number": 1, "name": "Road 1", "distance": 2.0},
+    {"number": 2, "name": "Road 2", "distance": 2.5},
+    {"number": 3, "name": "Road 3", "distance": 3.0}
+]
 
-            document.getElementById(road + "_status").textContent =
-                item.status;
+VEHICLE_CLASSES = [2, 3, 5, 7]
 
-            total += Number(item.vehicle_count || 0);
+# ==========================================
+# YOLO MODEL
+# ==========================================
 
-            if (item.status === "Running") {
-                running++;
-            }
-        }
+@st.cache_resource
+def load_model():
+    return YOLO("yolo11n.pt")
 
-        document.getElementById("total").textContent = total;
-        document.getElementById("running").textContent =
-            running + " / 3";
+# ==========================================
+# CAMERA SOURCE CONVERSION
+# ==========================================
 
-    } catch (error) {
-        console.error(error);
+def parse_source(value):
+    value = value.strip()
+
+    if value.isdigit():
+        return int(value)
+
+    return value
+
+# ==========================================
+# LIVE CAMERA ANALYSIS
+# ==========================================
+
+def analyze_camera(source, model, duration_seconds):
+
+    cap = cv2.VideoCapture(source)
+
+    if not cap.isOpened():
+        return None
+
+    counts = []
+    start_time = time.monotonic()
+
+    try:
+        while (
+            time.monotonic() - start_time
+            < duration_seconds
+        ):
+
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            result = model.predict(
+                frame,
+                classes=VEHICLE_CLASSES,
+                conf=0.35,
+                verbose=False
+            )[0]
+
+            counts.append(len(result.boxes))
+
+    finally:
+        cap.release()
+
+    if not counts:
+        return None
+
+    return {
+        "average": round(
+            float(np.mean(counts)), 1
+        ),
+        "maximum": int(np.max(counts)),
+        "samples": len(counts)
     }
-}
 
-refreshDashboard();
-setInterval(refreshDashboard, 2000);
-</script>
+# ==========================================
+# TRAFFIC CLASSIFICATION
+# ==========================================
 
-</body>
-</html>
-"""
+def classify_traffic(count):
 
+    # Demonstration thresholds
+    if count < 5:
+        return "LOW", 1.0
 
-# ---------------- FLASK ROUTES ----------------
+    elif count < 12:
+        return "MODERATE", 1.5
 
-@app.route("/")
-def home():
-    return render_template_string(
-        HTML_PAGE,
-        roads=list(ROADS.keys())
+    return "HIGH", 2.5
+
+# ==========================================
+# TRAVEL TIME ESTIMATION
+# ==========================================
+
+def calculate_time(distance, multiplier):
+
+    assumed_speed = 40.0
+
+    base_time = (
+        distance / assumed_speed
+    ) * 60
+
+    return round(base_time * multiplier, 1)
+
+# ==========================================
+# ARDUINO SERIAL COMMUNICATION
+# ==========================================
+
+def send_to_arduino(port, road_number, travel_time):
+
+    try:
+        with serial.Serial(
+            port=port,
+            baudrate=9600,
+            timeout=2,
+            write_timeout=2
+        ) as arduino:
+
+            # Arduino Uno resets when port opens
+            time.sleep(2)
+
+            message = (
+                f"{road_number},{travel_time:.1f}\n"
+            )
+
+            arduino.write(
+                message.encode("ascii")
+            )
+
+            arduino.flush()
+
+        return True, "Route sent to Arduino LCD."
+
+    except (serial.SerialException, OSError) as error:
+        return False, str(error)
+
+# ==========================================
+# SESSION STATE
+# ==========================================
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+# ==========================================
+# TRAFFIC MONITORING CONTROL
+# ==========================================
+
+with st.container(border=True):
+
+    st.subheader("AUTOMATIC TRAFFIC MONITORING")
+
+    st.write(
+        "Capture traffic directly from three cameras. "
+        "No manual video upload is required."
     )
 
+    if st.button(
+        "START AUTOMATIC ANALYSIS",
+        type="primary",
+        width="stretch"
+    ):
 
-@app.route("/data")
-def get_data():
-    with lock:
-        return jsonify({
-            road: {
-                key: value
-                for key, value in data.items()
-                if key != "frame"
-            }
-            for road, data in road_data.items()
-        })
+        st.session_state.results = None
 
+        sources = [
+            parse_source(source1),
+            parse_source(source2),
+            parse_source(source3)
+        ]
 
-@app.route("/video/<path:road>")
-def video_feed(road):
-    if road not in ROADS:
-        return "Unknown road", 404
+        with st.spinner("Loading YOLO model..."):
+            model = load_model()
 
-    def generate():
-        while True:
-            with lock:
-                frame = road_data[road]["frame"]
+        results = []
+        progress = st.progress(0)
 
-            if frame is not None:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + frame + b"\r\n"
+        for index, (road, source) in enumerate(
+            zip(ROADS, sources)
+        ):
+
+            with st.spinner(
+                f"Monitoring {road['name']}..."
+            ):
+
+                analysis = analyze_camera(
+                    source,
+                    model,
+                    duration
                 )
 
-            time.sleep(0.08)
+            if analysis is None:
+                st.error(
+                    f"Cannot access {road['name']} camera. "
+                    "Check its source and connection."
+                )
+                st.stop()
 
-    return Response(
-        generate(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
+            traffic, multiplier = classify_traffic(
+                analysis["average"]
+            )
+
+            estimated_time = calculate_time(
+                road["distance"],
+                multiplier
+            )
+
+            results.append({
+                "number": road["number"],
+                "name": road["name"],
+                "count": analysis["average"],
+                "maximum": analysis["maximum"],
+                "traffic": traffic,
+                "time": estimated_time
+            })
+
+            progress.progress(
+                (index + 1) / 3
+            )
+
+        st.session_state.results = results
+
+        st.success(
+            "Automatic traffic analysis completed!"
+        )
+
+# ==========================================
+# DASHBOARD RESULTS
+# ==========================================
+
+results = st.session_state.results
+
+if results:
+
+    st.subheader("ROAD-WISE TRAFFIC STATUS")
+
+    columns = st.columns(3)
+
+    for column, road in zip(columns, results):
+
+        with column:
+
+            with st.container(border=True):
+
+                st.markdown(
+                    f"### {road['name']}"
+                )
+
+                st.metric(
+                    "Average Visible Vehicles",
+                    f"{road['count']:.1f}"
+                )
+
+                if road["traffic"] == "LOW":
+                    st.success("LOW TRAFFIC")
+
+                elif road["traffic"] == "MODERATE":
+                    st.warning("MODERATE TRAFFIC")
+
+                else:
+                    st.error("HIGH TRAFFIC")
+
+                st.metric(
+                    "Estimated Travel Time",
+                    f"{road['time']:.1f} min"
+                )
+
+    # ======================================
+    # COMPARISON TABLE
+    # ======================================
+
+    st.subheader("TRAFFIC COMPARISON")
+
+    with st.container(border=True):
+
+        table_data = []
+
+        for road in results:
+
+            table_data.append({
+                "Road": road["name"],
+                "Avg. Vehicles": road["count"],
+                "Traffic Level": road["traffic"],
+                "Estimated Time (min)": road["time"]
+            })
+
+        st.dataframe(
+            table_data,
+            hide_index=True,
+            width="stretch"
+        )
+
+    # ======================================
+    # ROUTE RECOMMENDATION
+    # ======================================
+
+    best_route = min(
+        results,
+        key=lambda road: road["time"]
     )
 
+    st.subheader(
+        "AMBULANCE ROUTE RECOMMENDATION"
+    )
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "online",
-        "roads": list(ROADS.keys())
-    })
+    with st.container(border=True):
 
-
-# ---------------- START APPLICATION ----------------
-
-if __name__ == "__main__":
-
-    for road, url in ROADS.items():
-        thread = threading.Thread(
-            target=process_road,
-            args=(road, url),
-            daemon=True
+        st.success(
+            "RECOMMENDED ROUTE: "
+            f"{best_route['name'].upper()}"
         )
-        thread.start()
 
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-        threaded=True
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Recommended Road",
+                best_route["name"]
+            )
+
+        with col2:
+            st.metric(
+                "Estimated Travel Time",
+                f"{best_route['time']:.1f} min"
+            )
+
+        with col3:
+            st.metric(
+                "Traffic Condition",
+                best_route["traffic"]
+            )
+
+    # ======================================
+    # ARDUINO LCD
+    # ======================================
+
+    st.subheader("ARDUINO UNO LCD COMMUNICATION")
+
+    with st.container(border=True):
+
+        st.info(
+            f"LCD PREVIEW: BEST ROAD "
+            f"{best_route['number']} | "
+            f"TIME: {best_route['time']:.1f} MIN"
+        )
+
+        if st.button(
+            "SEND ROUTE TO ARDUINO LCD",
+            width="stretch"
+        ):
+
+            success, message = send_to_arduino(
+                arduino_port,
+                best_route["number"],
+                best_route["time"]
+            )
+
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+
+    st.caption(
+        "Academic prototype only. Vehicle detections "
+        "are averages per frame. Travel-time estimates "
+        "are simulated and not validated for "
+        "real emergency navigation."
+    )
+
+else:
+
+    st.info(
+        "Configure your cameras and click "
+        "START AUTOMATIC ANALYSIS."
     )
