@@ -1,5 +1,4 @@
 streamlit
 ultralytics
 opencv-python-headless
-numpy
-pyserial
+requests
