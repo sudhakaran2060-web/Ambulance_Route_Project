@@ -2,13 +2,12 @@
 import streamlit as st
 import cv2
 import numpy as np
-import tempfile
-import os
 import time
+import serial
 from ultralytics import YOLO
 
 # ==========================================
-# PAGE CONFIGURATION
+# PAGE SETTINGS
 # ==========================================
 
 st.set_page_config(
@@ -18,20 +17,18 @@ st.set_page_config(
 )
 
 # ==========================================
-# PROFESSIONAL DASHBOARD DESIGN
+# PROFESSIONAL DESIGN
 # ==========================================
 
 st.markdown("""
 <style>
 .stApp {
     background-color: #f3f6fb;
-    color: #172b4d;
 }
 
 .block-container {
     max-width: 1300px;
     padding-top: 2rem;
-    padding-bottom: 2rem;
 }
 
 h1, h2, h3 {
@@ -39,26 +36,15 @@ h1, h2, h3 {
 }
 
 [data-testid="stMetric"] {
-    background-color: white;
+    background: white;
     border: 1px solid #cbd5e1;
     border-radius: 12px;
-    padding: 15px;
-}
-
-[data-testid="stMetricValue"] {
-    color: #123b67;
+    padding: 18px;
 }
 
 [data-testid="stDataFrame"] {
     border: 1px solid #cbd5e1;
     border-radius: 10px;
-}
-
-.stButton > button[kind="primary"] {
-    background-color: #123b67;
-    color: white;
-    border-radius: 8px;
-    font-weight: 600;
 }
 
 .dashboard-header {
@@ -73,41 +59,73 @@ h1, h2, h3 {
 .dashboard-header h2 {
     color: white !important;
     margin: 0;
-    font-size: 26px;
 }
 
 .dashboard-header p {
     color: #dbeafe;
-    margin-top: 8px;
     margin-bottom: 0;
+}
+
+.stButton > button[kind="primary"] {
+    background: #123b67;
+    color: white;
+    border-radius: 8px;
 }
 </style>
 """, unsafe_allow_html=True)
-
-# ==========================================
-# HEADER
-# ==========================================
 
 st.markdown("""
 <div class="dashboard-header">
     <h2>SMART AMBULANCE ROUTE MONITORING</h2>
     <p>
-        Intelligent Traffic Analysis and
-        Emergency Route Optimization
+        Automatic Traffic Detection and
+        Emergency Route Recommendation
     </p>
 </div>
 """, unsafe_allow_html=True)
 
 st.caption(
-    "Three-Road Monitoring | YOLO Detection | "
-    "Streamlit Dashboard | Arduino Uno LCD"
+    "YOLO Vehicle Detection | Three-Road Monitoring | "
+    "Arduino Uno LCD"
 )
 
 # ==========================================
-# CONFIGURATION
+# CAMERA CONFIGURATION
 # ==========================================
 
-VEHICLE_CLASSES = [2, 3, 5, 7]
+st.sidebar.header("Camera Settings")
+
+st.sidebar.caption(
+    "Use 0, 1, 2 for local webcams, "
+    "or an ESP32-CAM/IP camera stream URL."
+)
+
+source1 = st.sidebar.text_input(
+    "Road 1 Camera",
+    value="0"
+)
+
+source2 = st.sidebar.text_input(
+    "Road 2 Camera",
+    value="1"
+)
+
+source3 = st.sidebar.text_input(
+    "Road 3 Camera",
+    value="2"
+)
+
+arduino_port = st.sidebar.text_input(
+    "Arduino COM Port",
+    value="COM3"
+)
+
+duration = st.sidebar.slider(
+    "Analysis duration per road (seconds)",
+    min_value=5,
+    max_value=30,
+    value=10
+)
 
 ROADS = [
     {"number": 1, "name": "Road 1", "distance": 2.0},
@@ -115,33 +133,10 @@ ROADS = [
     {"number": 3, "name": "Road 3", "distance": 3.0}
 ]
 
-# ==========================================
-# SIDEBAR
-# ==========================================
-
-with st.sidebar:
-    st.header("System Settings")
-
-    arduino_port = st.text_input(
-        "Arduino COM Port",
-        value="COM3"
-    )
-
-    frame_limit = st.slider(
-        "Frames to analyze per road",
-        min_value=10,
-        max_value=150,
-        value=90,
-        step=10
-    )
-
-    st.caption(
-        "Arduino USB serial communication "
-        "is available only when running locally."
-    )
+VEHICLE_CLASSES = [2, 3, 5, 7]
 
 # ==========================================
-# LOAD YOLO MODEL
+# YOLO MODEL
 # ==========================================
 
 @st.cache_resource
@@ -149,47 +144,61 @@ def load_model():
     return YOLO("yolo11n.pt")
 
 # ==========================================
-# VIDEO ANALYSIS
+# CAMERA SOURCE CONVERSION
 # ==========================================
 
-def analyze_video(video_path, model, sample_limit):
+def parse_source(value):
+    value = value.strip()
 
-    cap = cv2.VideoCapture(video_path)
+    if value.isdigit():
+        return int(value)
+
+    return value
+
+# ==========================================
+# LIVE CAMERA ANALYSIS
+# ==========================================
+
+def analyze_camera(source, model, duration_seconds):
+
+    cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
         return None
 
     counts = []
-    frame_number = 0
+    start_time = time.monotonic()
 
-    while len(counts) < sample_limit:
+    try:
+        while (
+            time.monotonic() - start_time
+            < duration_seconds
+        ):
 
-        success, frame = cap.read()
+            success, frame = cap.read()
 
-        if not success:
-            break
+            if not success:
+                break
 
-        frame_number += 1
+            result = model.predict(
+                frame,
+                classes=VEHICLE_CLASSES,
+                conf=0.35,
+                verbose=False
+            )[0]
 
-        if frame_number % 10 != 0:
-            continue
+            counts.append(len(result.boxes))
 
-        result = model.predict(
-            frame,
-            classes=VEHICLE_CLASSES,
-            conf=0.35,
-            verbose=False
-        )[0]
-
-        counts.append(len(result.boxes))
-
-    cap.release()
+    finally:
+        cap.release()
 
     if not counts:
         return None
 
     return {
-        "average": round(float(np.mean(counts)), 1),
+        "average": round(
+            float(np.mean(counts)), 1
+        ),
         "maximum": int(np.max(counts)),
         "samples": len(counts)
     }
@@ -200,17 +209,17 @@ def analyze_video(video_path, model, sample_limit):
 
 def classify_traffic(count):
 
+    # Demonstration thresholds
     if count < 5:
         return "LOW", 1.0
 
     elif count < 12:
         return "MODERATE", 1.5
 
-    else:
-        return "HIGH", 2.5
+    return "HIGH", 2.5
 
 # ==========================================
-# ESTIMATED TRAVEL TIME
+# TRAVEL TIME ESTIMATION
 # ==========================================
 
 def calculate_time(distance, multiplier):
@@ -224,14 +233,12 @@ def calculate_time(distance, multiplier):
     return round(base_time * multiplier, 1)
 
 # ==========================================
-# ARDUINO COMMUNICATION
+# ARDUINO SERIAL COMMUNICATION
 # ==========================================
 
 def send_to_arduino(port, road_number, travel_time):
 
     try:
-        import serial
-
         with serial.Serial(
             port=port,
             baudrate=9600,
@@ -239,18 +246,22 @@ def send_to_arduino(port, road_number, travel_time):
             write_timeout=2
         ) as arduino:
 
+            # Arduino Uno resets when port opens
             time.sleep(2)
 
             message = (
                 f"{road_number},{travel_time:.1f}\n"
             )
 
-            arduino.write(message.encode("ascii"))
+            arduino.write(
+                message.encode("ascii")
+            )
+
             arduino.flush()
 
-        return True, "Data sent to Arduino LCD."
+        return True, "Route sent to Arduino LCD."
 
-    except Exception as error:
+    except (serial.SerialException, OSError) as error:
         return False, str(error)
 
 # ==========================================
@@ -261,138 +272,96 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 # ==========================================
-# VIDEO UPLOAD
-# ==========================================
-
-st.subheader("UPLOAD ROAD TRAFFIC VIDEOS")
-
-with st.container(border=True):
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        video1 = st.file_uploader(
-            "Road 1 Video",
-            type=["mp4"],
-            key="video1"
-        )
-
-    with col2:
-        video2 = st.file_uploader(
-            "Road 2 Video",
-            type=["mp4"],
-            key="video2"
-        )
-
-    with col3:
-        video3 = st.file_uploader(
-            "Road 3 Video",
-            type=["mp4"],
-            key="video3"
-        )
-
-uploaded_videos = [video1, video2, video3]
-
-# ==========================================
-# ANALYZE BUTTON
+# TRAFFIC MONITORING CONTROL
 # ==========================================
 
 with st.container(border=True):
 
-    st.subheader("TRAFFIC ANALYSIS CONTROL")
+    st.subheader("AUTOMATIC TRAFFIC MONITORING")
+
+    st.write(
+        "Capture traffic directly from three cameras. "
+        "No manual video upload is required."
+    )
 
     if st.button(
-        "ANALYZE ALL THREE ROADS",
+        "START AUTOMATIC ANALYSIS",
         type="primary",
         width="stretch"
     ):
 
-        if not all(uploaded_videos):
-            st.error(
-                "Please upload all three traffic videos."
-            )
-            st.stop()
-
         st.session_state.results = None
-        results = []
+
+        sources = [
+            parse_source(source1),
+            parse_source(source2),
+            parse_source(source3)
+        ]
 
         with st.spinner("Loading YOLO model..."):
             model = load_model()
 
+        results = []
         progress = st.progress(0)
 
-        for index, (road, uploaded) in enumerate(
-            zip(ROADS, uploaded_videos)
+        for index, (road, source) in enumerate(
+            zip(ROADS, sources)
         ):
 
-            temp_path = None
+            with st.spinner(
+                f"Monitoring {road['name']}..."
+            ):
 
-            try:
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".mp4"
-                ) as temp_file:
-
-                    temp_file.write(uploaded.getvalue())
-                    temp_path = temp_file.name
-
-                with st.spinner(
-                    f"Analyzing {road['name']}..."
-                ):
-                    analysis = analyze_video(
-                        temp_path,
-                        model,
-                        frame_limit
-                    )
-
-                if analysis is None:
-                    st.error(
-                        f"Unable to analyze {road['name']}."
-                    )
-                    st.stop()
-
-                traffic, multiplier = classify_traffic(
-                    analysis["average"]
+                analysis = analyze_camera(
+                    source,
+                    model,
+                    duration
                 )
 
-                estimated_time = calculate_time(
-                    road["distance"],
-                    multiplier
+            if analysis is None:
+                st.error(
+                    f"Cannot access {road['name']} camera. "
+                    "Check its source and connection."
                 )
+                st.stop()
 
-                results.append({
-                    "number": road["number"],
-                    "name": road["name"],
-                    "count": analysis["average"],
-                    "maximum": analysis["maximum"],
-                    "samples": analysis["samples"],
-                    "traffic": traffic,
-                    "time": estimated_time
-                })
+            traffic, multiplier = classify_traffic(
+                analysis["average"]
+            )
 
-                progress.progress(
-                    (index + 1) / len(ROADS)
-                )
+            estimated_time = calculate_time(
+                road["distance"],
+                multiplier
+            )
 
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
+            results.append({
+                "number": road["number"],
+                "name": road["name"],
+                "count": analysis["average"],
+                "maximum": analysis["maximum"],
+                "traffic": traffic,
+                "time": estimated_time
+            })
+
+            progress.progress(
+                (index + 1) / 3
+            )
 
         st.session_state.results = results
 
         st.success(
-            "Traffic analysis completed successfully!"
+            "Automatic traffic analysis completed!"
         )
 
 # ==========================================
-# DISPLAY RESULTS
+# DASHBOARD RESULTS
 # ==========================================
 
 results = st.session_state.results
 
 if results:
 
-    st.subheader("ROAD-WISE TRAFFIC MONITORING")
+    st.subheader("ROAD-WISE TRAFFIC STATUS")
 
     columns = st.columns(3)
 
@@ -402,7 +371,9 @@ if results:
 
             with st.container(border=True):
 
-                st.markdown(f"### {road['name']}")
+                st.markdown(
+                    f"### {road['name']}"
+                )
 
                 st.metric(
                     "Average Visible Vehicles",
@@ -423,13 +394,8 @@ if results:
                     f"{road['time']:.1f} min"
                 )
 
-                st.caption(
-                    f"Maximum visible vehicles: "
-                    f"{road['maximum']}"
-                )
-
     # ======================================
-    # TRAFFIC COMPARISON
+    # COMPARISON TABLE
     # ======================================
 
     st.subheader("TRAFFIC COMPARISON")
@@ -443,7 +409,6 @@ if results:
             table_data.append({
                 "Road": road["name"],
                 "Avg. Vehicles": road["count"],
-                "Max. Vehicles": road["maximum"],
                 "Traffic Level": road["traffic"],
                 "Estimated Time (min)": road["time"]
             })
@@ -455,7 +420,7 @@ if results:
         )
 
     # ======================================
-    # RECOMMENDED ROUTE
+    # ROUTE RECOMMENDATION
     # ======================================
 
     best_route = min(
@@ -495,12 +460,10 @@ if results:
             )
 
     # ======================================
-    # ARDUINO LCD COMMUNICATION
+    # ARDUINO LCD
     # ======================================
 
-    st.subheader(
-        "ARDUINO UNO LCD COMMUNICATION"
-    )
+    st.subheader("ARDUINO UNO LCD COMMUNICATION")
 
     with st.container(border=True):
 
@@ -510,14 +473,8 @@ if results:
             f"TIME: {best_route['time']:.1f} MIN"
         )
 
-        st.caption(
-            "USB serial communication works only "
-            "when Streamlit runs on the same "
-            "computer as the Arduino."
-        )
-
         if st.button(
-            "SEND RECOMMENDED ROUTE TO LCD",
+            "SEND ROUTE TO ARDUINO LCD",
             width="stretch"
         ):
 
@@ -529,24 +486,19 @@ if results:
 
             if success:
                 st.success(message)
-
             else:
-                st.error(
-                    "Arduino communication failed: "
-                    + message
-                )
-
-    st.divider()
+                st.error(message)
 
     st.caption(
-        "Academic demonstration only. Vehicle counts "
-        "are averages per sampled frame, not unique "
-        "vehicles. Travel times are illustrative "
-        "and are not validated for emergency use."
+        "Academic prototype only. Vehicle detections "
+        "are averages per frame. Travel-time estimates "
+        "are simulated and not validated for "
+        "real emergency navigation."
     )
 
 else:
+
     st.info(
-        "Upload three MP4 videos and click "
-        "ANALYZE ALL THREE ROADS."
+        "Configure your cameras and click "
+        "START AUTOMATIC ANALYSIS."
     )
