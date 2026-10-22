@@ -1,918 +1,490 @@
 
+import os
 import time
 import threading
 from pathlib import Path
 
 import cv2
-import numpy as np
 import requests
 import streamlit as st
 from ultralytics import YOLO
 
-try:
-    import serial
-except ImportError:
-    serial = None
-
-
-# ============================================================
-# PAGE SETTINGS
-# ============================================================
+# =====================================================
+# STREAMLIT CONFIGURATION
+# =====================================================
 
 st.set_page_config(
     page_title="Smart City Traffic Monitoring",
-    page_icon="🚑",
+    page_icon="🚦",
     layout="wide"
 )
 
-
-# ============================================================
-# USER SETTINGS
-# ============================================================
+# =====================================================
+# ROAD SOURCES
+# =====================================================
 
 GITHUB_BASE = (
     "https://raw.githubusercontent.com/"
     "sudhakaran2060-web/Ambulance_Route_Project/main/"
 )
 
-# CHANGE THIS TO YOUR ACTUAL ESP32-CAM STREAM URL
-ESP32_CAM_URL = "http://172.24.146.53:81/stream"
-
-# Arduino Uno USB connection
-ARDUINO_PORT = "COM9"
-ARDUINO_BAUD = 115200
-ENABLE_ARDUINO_LCD = True
+# Replace this with the actual ESP32-CAM IP address.
+ESP32_CAM_URL = "http://192.168.1.105:81/stream"
 
 ROAD_SOURCES = {
-    "Road 1": GITHUB_BASE + "road1.mp4",
-    "Road 2": GITHUB_BASE + "road2.mp4",
-    "Road 3": GITHUB_BASE + "road3.mp4",
-    "Road 4": ESP32_CAM_URL
+    "Road 1": {
+        "type": "video",
+        "url": GITHUB_BASE + "road1.mp4",
+    },
+    "Road 2": {
+        "type": "video",
+        "url": GITHUB_BASE + "road2.mp4",
+    },
+    "Road 3": {
+        "type": "video",
+        "url": GITHUB_BASE + "road3.mp4",
+    },
+    "Road 4": {
+        "type": "esp32cam",
+        "url": ESP32_CAM_URL,
+    },
 }
 
-LIVE_ROADS = {"Road 4"}
-
 VIDEO_DIR = Path("videos")
+VIDEO_DIR.mkdir(exist_ok=True)
 
 MODEL_PATH = "yolo11n.pt"
 CONFIDENCE = 0.35
+VEHICLE_CLASS_IDS = [2, 3, 5, 7]
+MAX_DENSITY_VEHICLES = 20
 FRAME_WIDTH = 640
-MAX_VEHICLES = 20
 
-PROCESS_DELAY = 0.10
-STALE_SECONDS = 15
-RECONNECT_DELAY = 3
-LCD_INTERVAL = 5
+# =====================================================
+# DOWNLOAD STORED GITHUB VIDEOS
+# =====================================================
 
-CAM_CONNECT_TIMEOUT = 5
-CAM_READ_TIMEOUT = 10
-MAX_MJPEG_BUFFER = 2 * 1024 * 1024
+def download_video(road, url):
 
-VEHICLE_NAMES = {
-    "car",
-    "bus",
-    "truck",
-    "motorcycle"
-}
-
-
-# ============================================================
-# DOWNLOAD GITHUB VIDEOS
-# ============================================================
-
-def download_video(road_name, url):
-
-    VIDEO_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    filename = VIDEO_DIR / (
+        road.lower().replace(" ", "") + ".mp4"
     )
 
-    filename = (
-        road_name.lower().replace(" ", "")
-        + ".mp4"
-    )
+    if filename.exists() and filename.stat().st_size > 0:
+        return str(filename)
 
-    video_path = VIDEO_DIR / filename
-
-    if video_path.exists() and video_path.stat().st_size > 0:
-        return str(video_path)
-
-    temp_path = video_path.with_suffix(".download")
+    temp_file = Path(str(filename) + ".part")
 
     try:
-        with requests.get(
+        response = requests.get(
             url,
             stream=True,
             timeout=(15, 120)
-        ) as response:
-
-            response.raise_for_status()
-
-            with open(temp_path, "wb") as file:
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
-                    if chunk:
-                        file.write(chunk)
-
-        temp_path.replace(video_path)
-
-        return str(video_path)
-
-    except Exception:
-
-        if temp_path.exists():
-            temp_path.unlink()
-
-        raise
-
-
-# ============================================================
-# ESP32-CAM MJPEG FRAME READER
-# ============================================================
-
-def esp32cam_frames(url):
-
-    print("[Road 4] Connecting:", url)
-
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(
-            CAM_CONNECT_TIMEOUT,
-            CAM_READ_TIMEOUT
-        ),
-        headers={
-            "Accept": "multipart/x-mixed-replace",
-            "Cache-Control": "no-cache"
-        }
-    ) as response:
-
+        )
         response.raise_for_status()
 
-        content_type = response.headers.get(
-            "Content-Type", ""
-        ).lower()
+        total_bytes = 0
 
-        if "multipart" not in content_type:
-            raise RuntimeError(
-                "URL did not return an MJPEG stream. "
-                f"Content-Type: {content_type}"
-            )
+        with open(temp_file, "wb") as file:
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+                if chunk:
+                    file.write(chunk)
+                    total_bytes += len(chunk)
 
-        buffer = bytearray()
+        if total_bytes == 0:
+            raise ValueError("Downloaded file is empty")
 
-        for chunk in response.iter_content(
-            chunk_size=8192
-        ):
+        os.replace(temp_file, filename)
+        return str(filename)
 
-            if not chunk:
-                continue
+    except Exception as error:
 
-            buffer.extend(chunk)
+        print(f"{road} download error: {error}")
 
-            while True:
+        if temp_file.exists():
+            temp_file.unlink()
 
-                start = buffer.find(b"\xff\xd8")
+        return None
 
-                if start < 0:
-                    if len(buffer) > 1:
-                        del buffer[:-1]
-                    break
-
-                if start > 0:
-                    del buffer[:start]
-
-                end = buffer.find(b"\xff\xd9", 2)
-
-                if end < 0:
-                    break
-
-                jpeg_data = bytes(buffer[:end + 2])
-                del buffer[:end + 2]
-
-                frame = cv2.imdecode(
-                    np.frombuffer(
-                        jpeg_data,
-                        dtype=np.uint8
-                    ),
-                    cv2.IMREAD_COLOR
-                )
-
-                if frame is not None:
-                    yield frame
-
-            if len(buffer) > MAX_MJPEG_BUFFER:
-                raise RuntimeError(
-                    "ESP32-CAM MJPEG buffer overflow"
-                )
-
-    raise RuntimeError(
-        "ESP32-CAM stream disconnected"
-    )
-
-
-# ============================================================
-# INITIALIZE SYSTEM
-# ============================================================
+# =====================================================
+# INITIALIZE YOLO AND SHARED STATE
+# =====================================================
 
 @st.cache_resource
 def initialize_system():
 
     model = YOLO(MODEL_PATH)
 
-    states = {}
-
-    for road_name in ROAD_SOURCES:
-
-        states[road_name] = {
+    state = {
+        road: {
             "count": 0,
             "density": 0,
             "level": "Waiting",
-            "status": "Starting",
+            "status": "Initializing",
+            "updated": "--",
             "frame": None,
-            "updated": 0
         }
-
-    return {
-        "model": model,
-        "states": states,
-        "lock": threading.RLock(),
-        "inference_lock": threading.Lock(),
-        "serial_lock": threading.Lock(),
-        "workers_started": False,
-        "arduino": None,
-        "lcd_message": "",
-        "lcd_sent_at": 0,
-        "lcd_status": "Not connected"
+        for road in ROAD_SOURCES
     }
 
+    state_lock = threading.RLock()
+    inference_lock = threading.Lock()
 
-# ============================================================
-# TRAFFIC CALCULATION
-# ============================================================
+    return model, state, state_lock, inference_lock
 
-def calculate_traffic(count):
-
-    density = min(
-        100,
-        round(count / MAX_VEHICLES * 100)
-    )
-
-    if count <= 5:
-        level = "Low"
-
-    elif count <= 12:
-        level = "Medium"
-
-    else:
-        level = "High"
-
-    return density, level
-
-
-# ============================================================
-# COUNT YOLO VEHICLES
-# ============================================================
-
-def count_vehicles(result):
-
-    if result.boxes is None:
-        return 0
-
-    count = 0
-
-    for class_id in result.boxes.cls.tolist():
-
-        name = result.names[int(class_id)]
-
-        if name in VEHICLE_NAMES:
-            count += 1
-
-    return count
-
-
-# ============================================================
-# YOLO FRAME PROCESSING
-# ============================================================
-
-def process_frame(system, road_name, frame):
-
-    height, width = frame.shape[:2]
-
-    if width > FRAME_WIDTH:
-
-        new_height = int(
-            height * FRAME_WIDTH / width
-        )
-
-        frame = cv2.resize(
-            frame,
-            (FRAME_WIDTH, new_height)
-        )
-
-    with system["inference_lock"]:
-
-        results = system["model"].predict(
-            frame,
-            conf=CONFIDENCE,
-            verbose=False
-        )
-
-        result = results[0]
-
-        count = count_vehicles(result)
-
-        annotated = result.plot()
-
-    density, level = calculate_traffic(count)
-
-    cv2.putText(
-        annotated,
-        f"{road_name} - Vehicles: {count}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        annotated,
-        f"Traffic: {level} ({density}%)",
-        (10, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 255),
-        2
-    )
-
-    if road_name in LIVE_ROADS:
-
-        cv2.putText(
-            annotated,
-            "LIVE ESP32-CAM",
-            (10, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2
-        )
-
-    success, encoded = cv2.imencode(
-        ".jpg",
-        annotated,
-        [cv2.IMWRITE_JPEG_QUALITY, 75]
-    )
-
-    if not success:
-        return
-
-    with system["lock"]:
-
-        system["states"][road_name].update({
-            "count": count,
-            "density": density,
-            "level": level,
-            "status": "Running",
-            "frame": encoded.tobytes(),
-            "updated": time.time()
-        })
-
-
-# ============================================================
+# =====================================================
 # PROCESS EACH ROAD
-# ============================================================
+# =====================================================
 
-def process_road(system, road_name, source):
+def process_road(
+    road,
+    config,
+    model,
+    state,
+    state_lock,
+    inference_lock
+):
 
-    is_live = road_name in LIVE_ROADS
+    source_type = config["type"]
+    source_url = config["url"]
 
     while True:
 
-        capture = None
-        frames = None
+        with state_lock:
+            state[road]["status"] = "Connecting..."
 
-        try:
+        if source_type == "video":
 
-            with system["lock"]:
-                system["states"][road_name]["status"] = (
-                    "Connecting ESP32-CAM"
-                    if is_live else
-                    "Downloading video"
+            video_path = download_video(
+                road,
+                source_url
+            )
+
+            if not video_path:
+
+                with state_lock:
+                    state[road]["status"] = (
+                        "GitHub video unavailable"
+                    )
+                    state[road]["level"] = "Unavailable"
+                    state[road]["frame"] = None
+
+                time.sleep(15)
+                continue
+
+            cap = cv2.VideoCapture(video_path)
+
+        else:
+            # Live ESP32-CAM MJPEG stream
+            cap = cv2.VideoCapture(source_url)
+
+        if not cap.isOpened():
+
+            with state_lock:
+                state[road]["status"] = (
+                    "Cannot open video source"
                 )
+                state[road]["level"] = "Unavailable"
+                state[road]["frame"] = None
 
-            if is_live:
+            cap.release()
+            time.sleep(5)
+            continue
 
-                frames = esp32cam_frames(source)
+        if source_type == "esp32cam":
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            else:
+        with state_lock:
+            state[road]["status"] = "Running"
 
-                video_path = download_video(
-                    road_name,
-                    source
-                )
+        print(f"{road}: analysis started")
 
-                capture = cv2.VideoCapture(
-                    video_path
-                )
+        while True:
 
-                if not capture.isOpened():
-                    raise RuntimeError(
-                        "Could not open MP4 video"
+            success, frame = cap.read()
+
+            if not success:
+
+                if source_type == "video":
+                    # Replay stored GitHub video
+                    cap.set(
+                        cv2.CAP_PROP_POS_FRAMES, 0
                     )
 
-            while True:
-
-                if is_live:
-
-                    frame = next(frames)
-
-                else:
-
-                    success, frame = capture.read()
+                    success, frame = cap.read()
 
                     if not success:
+                        break
 
-                        capture.set(
-                            cv2.CAP_PROP_POS_FRAMES,
-                            0
-                        )
+                else:
+                    # ESP32-CAM disconnected
+                    print(
+                        f"{road}: ESP32-CAM disconnected"
+                    )
+                    break
 
-                        success, frame = capture.read()
+            height, width = frame.shape[:2]
 
-                        if not success:
-                            raise RuntimeError(
-                                "Could not read MP4 frame"
-                            )
+            if width > FRAME_WIDTH:
 
-                process_frame(
-                    system,
-                    road_name,
-                    frame
+                new_height = int(
+                    height * FRAME_WIDTH / width
                 )
 
-                time.sleep(PROCESS_DELAY)
+                frame = cv2.resize(
+                    frame,
+                    (FRAME_WIDTH, new_height)
+                )
 
-        except Exception as error:
+            try:
 
-            print(f"[{road_name}] Error: {error}")
+                with inference_lock:
+                    result = model.predict(
+                        frame,
+                        classes=VEHICLE_CLASS_IDS,
+                        conf=CONFIDENCE,
+                        verbose=False
+                    )[0]
 
-            with system["lock"]:
+                count = (
+                    len(result.boxes)
+                    if result.boxes is not None
+                    else 0
+                )
 
-                system["states"][road_name].update({
-                    "count": 0,
-                    "density": 0,
-                    "level": "Unavailable",
-                    "status": f"Error: {str(error)[:150]}",
-                    "frame": None,
-                    "updated": 0
-                })
+                density = min(
+                    100,
+                    round(
+                        count * 100 /
+                        MAX_DENSITY_VEHICLES
+                    )
+                )
 
-            time.sleep(RECONNECT_DELAY)
+                if count <= 5:
+                    level = "Low"
 
-        finally:
+                elif count <= 12:
+                    level = "Medium"
 
-            if frames is not None:
-                frames.close()
+                else:
+                    level = "High"
 
-            if capture is not None:
-                capture.release()
+                annotated = result.plot()
 
+                ok, jpeg = cv2.imencode(
+                    ".jpg",
+                    annotated,
+                    [cv2.IMWRITE_JPEG_QUALITY, 75]
+                )
 
-# ============================================================
-# START WORKERS
-# ============================================================
+                with state_lock:
+
+                    state[road].update({
+                        "count": count,
+                        "density": density,
+                        "level": level,
+                        "status": "Running",
+                        "updated": time.strftime(
+                            "%H:%M:%S"
+                        ),
+                        "frame": (
+                            jpeg.tobytes()
+                            if ok else None
+                        ),
+                    })
+
+            except Exception as error:
+
+                print(
+                    f"{road} detection error: {error}"
+                )
+
+                with state_lock:
+                    state[road]["status"] = (
+                        "Detection error: "
+                        + str(error)
+                    )
+
+                time.sleep(1)
+
+            # Limit processing speed
+            time.sleep(0.1)
+
+        cap.release()
+
+        with state_lock:
+            state[road]["status"] = "Reconnecting..."
+            state[road]["level"] = "Unavailable"
+            state[road]["frame"] = None
+
+        time.sleep(3)
+
+# =====================================================
+# START BACKGROUND WORKERS
+# =====================================================
+
+model, road_state, state_lock, inference_lock = (
+    initialize_system()
+)
+
 
 @st.cache_resource
 def start_workers():
 
-    system = initialize_system()
+    workers = []
 
-    with system["lock"]:
+    for road, config in ROAD_SOURCES.items():
 
-        if not system["workers_started"]:
-
-            system["workers_started"] = True
-
-            for road_name, source in ROAD_SOURCES.items():
-
-                thread = threading.Thread(
-                    target=process_road,
-                    args=(
-                        system,
-                        road_name,
-                        source
-                    ),
-                    daemon=True,
-                    name=f"YOLO-{road_name}"
-                )
-
-                thread.start()
-
-    return system
-
-
-# ============================================================
-# AMBULANCE ROUTE SUGGESTION
-# ============================================================
-
-def suggest_best_road(snapshot):
-
-    now = time.time()
-
-    available = []
-
-    for road_name, data in snapshot.items():
-
-        if (
-            data["status"] == "Running"
-            and data["updated"] > 0
-            and now - data["updated"] < STALE_SECONDS
-        ):
-
-            available.append(
-                (road_name, data)
-            )
-
-    if not available:
-
-        return {
-            "road": "Unavailable",
-            "count": 0,
-            "density": 0,
-            "level": "Unknown"
-        }
-
-    best_road, best_data = min(
-        available,
-        key=lambda item: (
-            item[1]["count"],
-            item[0]
+        worker = threading.Thread(
+            target=process_road,
+            args=(
+                road,
+                config,
+                model,
+                road_state,
+                state_lock,
+                inference_lock,
+            ),
+            daemon=True,
+            name=f"{road}-worker"
         )
-    )
 
-    return {
-        "road": best_road,
-        "count": best_data["count"],
-        "density": best_data["density"],
-        "level": best_data["level"]
-    }
+        worker.start()
+        workers.append(worker)
+
+    return workers
 
 
-# ============================================================
-# ARDUINO UNO LCD
-# ============================================================
+workers = start_workers()
 
-def send_to_arduino(system, suggestion):
-
-    if not ENABLE_ARDUINO_LCD:
-        return "LCD disabled"
-
-    if serial is None:
-        return "Install pyserial"
-
-    if suggestion["road"] == "Unavailable":
-        return "Waiting for traffic data"
-
-    message = (
-        f"{suggestion['road']},"
-        f"{suggestion['level']}\n"
-    )
-
-    now = time.time()
-
-    with system["serial_lock"]:
-
-        if (
-            message == system["lcd_message"]
-            and now - system["lcd_sent_at"] < LCD_INTERVAL
-        ):
-            return system["lcd_status"]
-
-        try:
-
-            connection = system["arduino"]
-
-            if (
-                connection is None
-                or not connection.is_open
-            ):
-
-                connection = serial.Serial(
-                    ARDUINO_PORT,
-                    ARDUINO_BAUD,
-                    timeout=1,
-                    write_timeout=2
-                )
-
-                system["arduino"] = connection
-
-                # Uno resets when serial opens.
-                time.sleep(2)
-
-            connection.write(
-                message.encode("utf-8")
-            )
-
-            connection.flush()
-
-            system["lcd_message"] = message
-            system["lcd_sent_at"] = time.time()
-            system["lcd_status"] = (
-                "Arduino Uno LCD data sent"
-            )
-
-            return system["lcd_status"]
-
-        except Exception as error:
-
-            if system["arduino"] is not None:
-
-                try:
-                    system["arduino"].close()
-                except Exception:
-                    pass
-
-            system["arduino"] = None
-            system["lcd_message"] = ""
-            system["lcd_status"] = (
-                f"Arduino error: {error}"
-            )
-
-            return system["lcd_status"]
-
-
-# ============================================================
-# DASHBOARD HEADER
-# ============================================================
+# =====================================================
+# DASHBOARD UI
+# =====================================================
 
 st.title("🚦 Smart City Traffic Monitoring")
 
-st.write(
-    "YOLO11 | 4 Roads | ESP32-CAM Live | "
-    "Ambulance Route Suggestion | Arduino Uno LCD"
+st.caption(
+    "3 GitHub Traffic Videos + "
+    "1 Live ESP32-CAM | YOLO Vehicle Detection"
 )
 
 st.info(
-    "Roads 1, 2 and 3 use GitHub MP4 videos. "
-    "Road 4 uses the live ESP32-CAM MJPEG stream."
+    "Roads 1–3 use prerecorded GitHub videos. "
+    "Road 4 uses a live ESP32-CAM Wi-Fi stream."
 )
 
-with st.expander("Camera and Arduino Configuration"):
-
-    st.write(
-        "ESP32-CAM stream:",
-        ESP32_CAM_URL
-    )
-
-    st.write(
-        "Arduino Uno port:",
-        ARDUINO_PORT
-    )
-
-    st.write(
-        "Arduino Uno baud rate:",
-        ARDUINO_BAUD
-    )
-
-    st.write(
-        "Run this dashboard on your Windows PC "
-        "connected to the ESP32-CAM network."
-    )
-
-
-# ============================================================
-# START SYSTEM
-# ============================================================
-
-try:
-
-    system = start_workers()
-
-except Exception as error:
-
-    st.error(
-        f"Failed to initialize YOLO: {error}"
-    )
-
-    st.stop()
-
-
-# ============================================================
+# =====================================================
 # AUTO-REFRESH DASHBOARD
-# ============================================================
+# =====================================================
 
 @st.fragment(run_every="2s")
 def show_dashboard():
 
-    with system["lock"]:
-
+    with state_lock:
         snapshot = {
             road: data.copy()
-            for road, data in system["states"].items()
+            for road, data in road_state.items()
         }
 
-    now = time.time()
-
-    active_roads = [
-        road
-        for road, data in snapshot.items()
-        if (
-            data["status"] == "Running"
-            and data["updated"] > 0
-            and now - data["updated"] < STALE_SECONDS
-        )
-    ]
-
-    total_vehicles = sum(
-        snapshot[road]["count"]
-        for road in active_roads
+    running_roads = sum(
+        data["status"] == "Running"
+        for data in snapshot.values()
     )
 
-    # --------------------------------------------------------
-    # MAIN METRICS
-    # --------------------------------------------------------
+    total_vehicles = sum(
+        data["count"]
+        for data in snapshot.values()
+        if data["status"] == "Running"
+    )
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
     col1.metric(
-        "Total Vehicles",
-        total_vehicles
+        "Total Roads",
+        len(ROAD_SOURCES)
     )
 
     col2.metric(
-        "Active Roads",
-        f"{len(active_roads)}/4"
+        "Vehicles in Current Frames",
+        total_vehicles
     )
 
     col3.metric(
-        "Stored Video Roads",
-        "3"
-    )
-
-    col4.metric(
-        "Live ESP32-CAM",
-        (
-            "Online"
-            if "Road 4" in active_roads
-            else "Offline"
-        )
+        "Roads Running",
+        f"{running_roads} / {len(ROAD_SOURCES)}"
     )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # AMBULANCE ROUTE
-    # --------------------------------------------------------
+    road_columns = st.columns(4)
 
-    st.subheader(
-        "🚑 Ambulance Route Suggestion"
-    )
-
-    suggestion = suggest_best_road(snapshot)
-
-    if suggestion["road"] == "Unavailable":
-
-        st.warning(
-            "No valid traffic data available."
-        )
-
-    else:
-
-        st.success(
-            f"Suggested Route: {suggestion['road']}"
-        )
-
-        a, b, c = st.columns(3)
-
-        a.metric(
-            "Vehicle Count",
-            suggestion["count"]
-        )
-
-        b.metric(
-            "Traffic Density",
-            f"{suggestion['density']}%"
-        )
-
-        c.metric(
-            "Traffic Level",
-            suggestion["level"]
-        )
-
-    st.caption(
-        "Route suggestion uses detected vehicle counts. "
-        "It does not calculate actual travel time."
-    )
-
-    # --------------------------------------------------------
-    # ARDUINO UNO LCD
-    # --------------------------------------------------------
-
-    lcd_status = send_to_arduino(
-        system,
-        suggestion
-    )
-
-    st.caption(
-        "Arduino LCD: " + lcd_status
-    )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # ROAD VIDEO DISPLAY
-    # --------------------------------------------------------
-
-    st.subheader(
-        "📹 YOLO Road Monitoring"
-    )
-
-    road_items = list(snapshot.items())
-
-    for start in range(
-        0,
-        len(road_items),
-        2
+    for column, (road, data) in zip(
+        road_columns,
+        snapshot.items()
     ):
 
-        columns = st.columns(2)
+        with column:
 
-        for column, (road, data) in zip(
-            columns,
-            road_items[start:start + 2]
-        ):
+            with st.container(border=True):
 
-            with column:
+                st.subheader(road)
 
-                st.markdown(
-                    f"### {road}"
-                )
-
-                if road in LIVE_ROADS:
-
-                    st.caption(
-                        "🔴 ESP32-CAM Live Stream"
-                    )
-
+                if road == "Road 4":
+                    st.caption("ESP32-CAM — LIVE")
                 else:
-
-                    st.caption(
-                        "📁 GitHub Stored Video"
-                    )
+                    st.caption("GitHub — STORED VIDEO")
 
                 if data["frame"] is not None:
 
                     st.image(
                         data["frame"],
+                        caption=f"{road} YOLO Detection",
                         use_container_width=True
                     )
 
                 else:
-
-                    st.info(
-                        "Waiting for video..."
+                    st.warning(
+                        "Waiting for video frames..."
                     )
 
-                c1, c2, c3 = st.columns(3)
-
-                c1.metric(
-                    "Vehicles",
+                st.metric(
+                    "Vehicle Count",
                     data["count"]
                 )
 
-                c2.metric(
-                    "Density",
-                    f"{data['density']}%"
+                st.metric(
+                    "Traffic Density",
+                    f'{data["density"]}%'
                 )
 
-                c3.metric(
-                    "Traffic",
-                    data["level"]
-                )
+                if data["level"] == "High":
+                    st.error("HIGH TRAFFIC")
 
-                if road in active_roads:
+                elif data["level"] == "Medium":
+                    st.warning("MEDIUM TRAFFIC")
 
-                    st.success("Connected")
+                elif data["level"] == "Low":
+                    st.success("LOW TRAFFIC")
 
                 else:
+                    st.info(data["level"])
 
-                    st.error(
-                        data["status"]
-                    )
+                st.caption(
+                    f'Status: {data["status"]}'
+                )
 
-                if data["updated"] > 0:
-
-                    st.caption(
-                        "Updated: "
-                        + time.strftime(
-                            "%H:%M:%S",
-                            time.localtime(
-                                data["updated"]
-                            )
-                        )
-                    )
+                st.caption(
+                    f'Updated: {data["updated"]}'
+                )
 
 
 show_dashboard()
+
+st.divider()
+
+st.caption(
+    "Academic prototype: counts are per-frame "
+    "vehicle detections, not unique vehicle totals. "
+    "Traffic density is an illustrative score."
+)
