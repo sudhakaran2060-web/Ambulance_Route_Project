@@ -29,7 +29,7 @@ GITHUB_BASE = (
 )
 
 # Replace this with the actual ESP32-CAM IP address.
-ESP32_CAM_URL = "http://192.168.1.105:81/stream"
+ESP32_CAM_URL = http://172.24.146.53:81/stream
 
 ROAD_SOURCES = {
     "Road 1": {
